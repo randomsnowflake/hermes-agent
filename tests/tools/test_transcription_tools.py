@@ -1348,3 +1348,127 @@ class TestExplicitOpenaiSelectionError:
 
         assert result["success"] is False
         assert "No STT provider available" in result["error"]
+class TestOpenAIQuietAudioPolicy:
+    def test_quiet_audio_is_normalized(self, sample_wav, tmp_path):
+        from tools.transcription_tools import _prepare_openai_audio_for_policy
+
+        config = {
+            "normalize_quiet_audio": True,
+            "quiet_threshold_lufs": -32,
+            "normalization_target_lufs": -16,
+        }
+        with patch(
+            "tools.transcription_tools._measure_integrated_loudness",
+            return_value=-45.2,
+        ), patch(
+            "tools.transcription_tools._find_ffmpeg_binary",
+            return_value="/usr/bin/ffmpeg",
+        ), patch(
+            "tools.transcription_tools._run_ffmpeg_stt_encode"
+        ) as mock_encode:
+            result = _prepare_openai_audio_for_policy(
+                sample_wav, str(tmp_path), config
+            )
+
+        assert result != sample_wav
+        assert result.endswith("-normalized.m4a")
+        mock_encode.assert_called_once()
+        assert "loudnorm=I=-16.0" in mock_encode.call_args.kwargs["audio_filter"]
+
+    def test_normal_volume_audio_is_unchanged(self, sample_wav, tmp_path):
+        from tools.transcription_tools import _prepare_openai_audio_for_policy
+
+        config = {
+            "normalize_quiet_audio": True,
+            "quiet_threshold_lufs": -32,
+            "normalization_target_lufs": -16,
+        }
+        with patch(
+            "tools.transcription_tools._measure_integrated_loudness",
+            return_value=-22.0,
+        ), patch(
+            "tools.transcription_tools._run_ffmpeg_stt_encode"
+        ) as mock_encode:
+            result = _prepare_openai_audio_for_policy(
+                sample_wav, str(tmp_path), config
+            )
+
+        assert result == sample_wav
+        mock_encode.assert_not_called()
+
+    def test_silent_nonfinite_loudness_is_not_amplified(self, sample_wav, tmp_path):
+        from tools.transcription_tools import _prepare_openai_audio_for_policy
+
+        config = {"normalize_quiet_audio": True}
+        with patch(
+            "tools.transcription_tools._measure_integrated_loudness",
+            return_value=float("-inf"),
+        ), patch(
+            "tools.transcription_tools._run_ffmpeg_stt_encode"
+        ) as mock_encode:
+            result = _prepare_openai_audio_for_policy(
+                sample_wav, str(tmp_path), config
+            )
+
+        assert result == sample_wav
+        mock_encode.assert_not_called()
+
+    def test_sparse_transcript_retries_with_fallback_model(self, sample_wav):
+        from tools.transcription_tools import _transcribe_openai_with_policy
+
+        config = {
+            "fallback_model": "gpt-4o-transcribe",
+            "retry_min_words_per_second": 1.0,
+            "retry_min_audio_seconds": 10,
+        }
+        sparse = {"success": True, "transcript": "only a few words", "provider": "openai"}
+        complete = {
+            "success": True,
+            "transcript": "this is a much more complete transcription containing the full spoken request " * 2,
+            "provider": "openai",
+        }
+        with patch(
+            "tools.transcription_tools._probe_audio_duration",
+            return_value=30.0,
+        ), patch(
+            "tools.transcription_tools._transcribe_openai",
+            side_effect=[sparse, complete],
+        ) as mock_transcribe:
+            result = _transcribe_openai_with_policy(
+                sample_wav, "gpt-transcribe", config
+            )
+
+        assert result["transcript"] == complete["transcript"]
+        assert result["recovered_with_model"] == "gpt-4o-transcribe"
+        assert [call.args[1] for call in mock_transcribe.call_args_list] == [
+            "gpt-transcribe",
+            "gpt-4o-transcribe",
+        ]
+
+    def test_complete_transcript_does_not_retry(self, sample_wav):
+        from tools.transcription_tools import _transcribe_openai_with_policy
+
+        config = {
+            "fallback_model": "gpt-4o-transcribe",
+            "retry_min_words_per_second": 1.0,
+            "retry_min_audio_seconds": 10,
+        }
+        complete = {
+            "success": True,
+            "transcript": "one two three four five six seven eight nine ten eleven twelve",
+            "provider": "openai",
+        }
+        with patch(
+            "tools.transcription_tools._probe_audio_duration",
+            return_value=10.0,
+        ), patch(
+            "tools.transcription_tools._transcribe_openai",
+            return_value=complete,
+        ) as mock_transcribe:
+            result = _transcribe_openai_with_policy(
+                sample_wav, "gpt-transcribe", config
+            )
+
+        assert result == complete
+        mock_transcribe.assert_called_once()
+
