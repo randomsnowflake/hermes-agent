@@ -1472,3 +1472,57 @@ class TestOpenAIQuietAudioPolicy:
         assert result == complete
         mock_transcribe.assert_called_once()
 
+    def test_complete_cjk_transcript_does_not_retry(self, sample_wav):
+        from tools.transcription_tools import _transcribe_openai_with_policy
+
+        config = {
+            "fallback_model": "gpt-4o-transcribe",
+            "retry_min_words_per_second": 1.0,
+            "retry_min_audio_seconds": 10,
+        }
+        complete = {
+            "success": True,
+            "transcript": "これは静かな録音ですが内容は最後まで正しく文字起こしされています",
+            "provider": "openai",
+        }
+        with patch(
+            "tools.transcription_tools._probe_audio_duration",
+            return_value=10.0,
+        ), patch(
+            "tools.transcription_tools._transcribe_openai",
+            return_value=complete,
+        ) as mock_transcribe:
+            result = _transcribe_openai_with_policy(
+                sample_wav, "gpt-transcribe", config
+            )
+
+        assert result == complete
+        mock_transcribe.assert_called_once()
+
+    def test_cjk_fallback_comparison_uses_script_aware_units(self, sample_wav):
+        from tools.transcription_tools import _transcribe_openai_with_policy
+
+        config = {
+            "fallback_model": "gpt-4o-transcribe",
+            "retry_min_words_per_second": 2.0,
+            "retry_min_audio_seconds": 10,
+        }
+        primary = {"success": True, "transcript": "短い結果", "provider": "openai"}
+        fallback = {
+            "success": True,
+            "transcript": "静かな録音でも完全な内容を最後まで正確に文字起こししました",
+            "provider": "openai",
+        }
+        with patch(
+            "tools.transcription_tools._probe_audio_duration",
+            return_value=10.0,
+        ), patch(
+            "tools.transcription_tools._transcribe_openai",
+            side_effect=[primary, fallback],
+        ):
+            result = _transcribe_openai_with_policy(
+                sample_wav, "gpt-transcribe", config
+            )
+
+        assert result["transcript"] == fallback["transcript"]
+        assert result["recovered_with_model"] == "gpt-4o-transcribe"
