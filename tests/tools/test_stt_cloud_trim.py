@@ -173,6 +173,31 @@ class TestProviderGating:
             ("transcribe", normalized_path, "gpt-transcribe"),
         ]
 
+    def test_openai_policy_temp_dir_is_cleaned_when_normalization_raises(self, tmp_path):
+        wav = _write_wav(tmp_path / "quiet.wav", [("tone", 1)])
+        work_dirs = []
+
+        def fail_prepare(file_path, work_dir, config):
+            work_dirs.append(Path(work_dir))
+            (Path(work_dir) / "partial.m4a").write_bytes(b"partial")
+            raise RuntimeError("normalization failed")
+
+        config = {
+            "provider": "openai",
+            "enabled": True,
+            "openai": {"model": "gpt-transcribe", "normalize_quiet_audio": True},
+        }
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="openai"), \
+             patch("tools.transcription_tools._prepare_openai_audio_for_policy",
+                   side_effect=fail_prepare):
+            from tools.transcription_tools import _transcribe_prepared_audio
+            with pytest.raises(RuntimeError, match="normalization failed"):
+                _transcribe_prepared_audio(wav)
+
+        assert len(work_dirs) == 1
+        assert not work_dirs[0].exists()
+
     def test_trim_returning_none_uploads_original(self, tmp_path):
         wav = _write_wav(tmp_path / "a.wav", [("tone", 1)])
         seen = {}

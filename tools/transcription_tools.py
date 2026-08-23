@@ -298,6 +298,19 @@ def _config_float(config: Dict[str, Any], key: str, default: float) -> float:
         return default
 
 
+_UNSEGMENTED_SCRIPT_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]"
+)
+
+
+def _transcript_density_units(transcript: str) -> int:
+    """Count words plus characters from commonly unsegmented CJK scripts."""
+    unsegmented_characters = len(_UNSEGMENTED_SCRIPT_RE.findall(transcript))
+    segmented_text = _UNSEGMENTED_SCRIPT_RE.sub(" ", transcript)
+    segmented_words = len(re.findall(r"\b\w+\b", segmented_text, re.UNICODE))
+    return segmented_words + unsegmented_characters
+
+
 def _measure_integrated_loudness(file_path: str) -> Optional[float]:
     """Return EBU R128 integrated loudness via ffmpeg's loudnorm analysis."""
     ffmpeg = _find_ffmpeg_binary()
@@ -2472,18 +2485,18 @@ def _transcribe_openai_with_policy(
             openai_config, "retry_min_words_per_second", 0.0
         ))
         transcript = str(primary.get("transcript") or "")
-        words = len(re.findall(r"\b\w+\b", transcript, re.UNICODE))
+        density_units = _transcript_density_units(transcript)
         should_retry = bool(
             duration
             and duration >= minimum_duration
             and minimum_rate > 0
-            and words / duration < minimum_rate
+            and density_units / duration < minimum_rate
         )
         if should_retry:
             logger.warning(
-                "Sparse OpenAI STT result from %s: %d words for %.1fs; retrying with %s",
+                "Sparse OpenAI STT result from %s: %d density units for %.1fs; retrying with %s",
                 model_name,
-                words,
+                density_units,
                 duration,
                 fallback_model,
             )
@@ -2497,13 +2510,9 @@ def _transcribe_openai_with_policy(
     if not fallback.get("success"):
         return primary
 
-    primary_words = len(re.findall(
-        r"\b\w+\b", str(primary.get("transcript") or ""), re.UNICODE
-    ))
-    fallback_words = len(re.findall(
-        r"\b\w+\b", str(fallback.get("transcript") or ""), re.UNICODE
-    ))
-    if not primary.get("success") or fallback_words > primary_words:
+    primary_units = _transcript_density_units(str(primary.get("transcript") or ""))
+    fallback_units = _transcript_density_units(str(fallback.get("transcript") or ""))
+    if not primary.get("success") or fallback_units > primary_units:
         fallback["recovered_with_model"] = fallback_model
         return fallback
     return primary
@@ -3142,37 +3151,32 @@ def _transcribe_prepared_audio(
     # Quiet speech must be normalized before silence trimming. Otherwise the
     # default -40 dB silence gate can classify whispered words as silence and
     # permanently remove them before the provider sees the file.
-    policy_cleanup_dir: Optional[str] = None
-    if provider == "openai":
-        openai_cfg = stt_config.get("openai") or {}
-        policy_work_dir = tempfile.mkdtemp(prefix="hermes-openai-stt-input-")
-        normalized = _prepare_openai_audio_for_policy(
-            file_path, policy_work_dir, openai_cfg
-        )
-        if normalized != file_path:
-            file_path = normalized
-            policy_cleanup_dir = policy_work_dir
-        else:
-            shutil.rmtree(policy_work_dir, ignore_errors=True)
-
-    # Pre-upload silence trim for built-in cloud providers: local whisper gets
-    # Silero VAD, cloud endpoints get the raw file — collapse long pauses
-    # client-side so silence isn't uploaded, billed, or hallucinated on.
-    # Best-effort: any failure uploads the original untouched.
+    policy_temp_dir: Optional[tempfile.TemporaryDirectory[str]] = None
     trim_cleanup_dir: Optional[str] = None
-    if provider in CLOUD_STT_PROVIDERS:
-        trimmed = _trim_silence_for_cloud_stt(file_path, stt_config)
-        if trimmed:
-            file_path = trimmed
-            trim_cleanup_dir = os.path.dirname(trimmed)
-
     try:
+        if provider == "openai":
+            openai_cfg = stt_config.get("openai") or {}
+            policy_temp_dir = tempfile.TemporaryDirectory(
+                prefix="hermes-openai-stt-input-"
+            )
+            file_path = _prepare_openai_audio_for_policy(
+                file_path, policy_temp_dir.name, openai_cfg
+            )
+
+        # Pre-upload silence trim for built-in cloud providers: local whisper
+        # gets Silero VAD; cloud endpoints get client-side pause removal.
+        if provider in CLOUD_STT_PROVIDERS:
+            trimmed = _trim_silence_for_cloud_stt(file_path, stt_config)
+            if trimmed:
+                file_path = trimmed
+                trim_cleanup_dir = os.path.dirname(trimmed)
+
         return _dispatch_stt_provider(file_path, provider, stt_config, model, source)
     finally:
         if trim_cleanup_dir:
             shutil.rmtree(trim_cleanup_dir, ignore_errors=True)
-        if policy_cleanup_dir:
-            shutil.rmtree(policy_cleanup_dir, ignore_errors=True)
+        if policy_temp_dir is not None:
+            policy_temp_dir.cleanup()
 
 
 def _dispatch_stt_provider(
