@@ -27,7 +27,9 @@ Usage::
         print(result["transcript"])
 """
 
+import json
 import logging
+import math
 import os
 import platform
 import queue
@@ -284,6 +286,90 @@ def _transcode_audio_for_stt(file_path: str, work_dir: str) -> tuple[Optional[st
     except Exception as exc:  # noqa: BLE001 - transcode is best-effort
         logger.error("unexpected STT transcode failure for %s: %s", file_path, exc, exc_info=True)
         return None, f"failed to transcode audio for the STT API: {exc}"
+
+
+def _config_float(config: Dict[str, Any], key: str, default: float) -> float:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _measure_integrated_loudness(file_path: str) -> Optional[float]:
+    """Return EBU R128 integrated loudness via ffmpeg's loudnorm analysis."""
+    ffmpeg = _find_ffmpeg_binary()
+    if not ffmpeg:
+        return None
+    command = [
+        ffmpeg, "-hide_banner", "-nostats", "-i", file_path,
+        "-af", "loudnorm=I=-16:LRA=11:TP=-1.5:print_format=json",
+        "-f", "null", "-",
+    ]
+    try:
+        completed = subprocess.run(
+            command, check=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=120,
+            stdin=subprocess.DEVNULL, creationflags=windows_hide_flags(),
+        )
+        matches = re.findall(r"\{\s*\"input_i\".*?\}", completed.stderr, re.DOTALL)
+        if not matches:
+            return None
+        return float(json.loads(matches[-1])["input_i"])
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        logger.warning("Could not measure STT input loudness for %s: %s", file_path, exc)
+        return None
+
+
+def _prepare_openai_audio_for_policy(
+    file_path: str,
+    work_dir: str,
+    openai_config: Dict[str, Any],
+) -> str:
+    """Conditionally normalize unusually quiet OpenAI STT input."""
+    if not is_truthy_value(openai_config.get("normalize_quiet_audio", False)):
+        return file_path
+
+    threshold = min(-12.0, max(-60.0, _config_float(
+        openai_config, "quiet_threshold_lufs", -32.0
+    )))
+    target = min(-12.0, max(-24.0, _config_float(
+        openai_config, "normalization_target_lufs", -16.0
+    )))
+    measured = _measure_integrated_loudness(file_path)
+    if measured is None or not math.isfinite(measured) or measured >= threshold:
+        return file_path
+
+    ffmpeg = _find_ffmpeg_binary()
+    if not ffmpeg:
+        logger.warning(
+            "Quiet STT input measured at %.1f LUFS but ffmpeg is unavailable; using original",
+            measured,
+        )
+        return file_path
+
+    output_path = os.path.join(
+        work_dir, f"{Path(file_path).stem or 'audio'}-normalized.m4a"
+    )
+    try:
+        _run_ffmpeg_stt_encode(
+            ffmpeg,
+            file_path,
+            output_path,
+            audio_filter=f"loudnorm=I={target:.1f}:LRA=11:TP=-1.5",
+        )
+        logger.info(
+            "Normalized quiet STT input %s from %.1f LUFS toward %.1f LUFS",
+            Path(file_path).name,
+            measured,
+            target,
+        )
+        return output_path
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("Quiet-audio normalization failed for %s: %s", file_path, exc)
+        return file_path
 
 
 def _find_whisper_binary() -> Optional[str]:
@@ -2370,6 +2456,71 @@ def _transcribe_openai(
         logger.error("%s transcription failed: %s", provider_label, e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Transcription failed: {e}"}
 
+
+def _transcribe_openai_with_policy(
+    file_path: str,
+    model_name: str,
+    openai_config: Dict[str, Any],
+    *,
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Retry sparse or failed OpenAI results with the configured fallback model."""
+    primary = _transcribe_openai(
+        file_path, model_name, language=language, prompt=prompt
+    )
+
+    fallback_model = str(openai_config.get("fallback_model") or "").strip()
+    if not fallback_model or fallback_model == model_name:
+        return primary
+
+    should_retry = not primary.get("success")
+    if primary.get("success"):
+        duration = _probe_audio_duration(file_path)
+        minimum_duration = max(0.0, _config_float(
+            openai_config, "retry_min_audio_seconds", 10.0
+        ))
+        minimum_rate = max(0.0, _config_float(
+            openai_config, "retry_min_words_per_second", 0.0
+        ))
+        transcript = str(primary.get("transcript") or "")
+        words = len(re.findall(r"\b\w+\b", transcript, re.UNICODE))
+        should_retry = bool(
+            duration
+            and duration >= minimum_duration
+            and minimum_rate > 0
+            and words / duration < minimum_rate
+        )
+        if should_retry:
+            logger.warning(
+                "Sparse OpenAI STT result from %s: %d words for %.1fs; retrying with %s",
+                model_name,
+                words,
+                duration,
+                fallback_model,
+            )
+
+    if not should_retry:
+        return primary
+
+    fallback = _transcribe_openai(
+        file_path, fallback_model, language=language, prompt=prompt
+    )
+    if not fallback.get("success"):
+        return primary
+
+    primary_words = len(re.findall(
+        r"\b\w+\b", str(primary.get("transcript") or ""), re.UNICODE
+    ))
+    fallback_words = len(re.findall(
+        r"\b\w+\b", str(fallback.get("transcript") or ""), re.UNICODE
+    ))
+    if not primary.get("success") or fallback_words > primary_words:
+        fallback["recovered_with_model"] = fallback_model
+        return fallback
+    return primary
+
+
 # ---------------------------------------------------------------------------
 # Provider: mistral (Voxtral Transcribe API)
 # ---------------------------------------------------------------------------
@@ -3000,6 +3151,22 @@ def _transcribe_prepared_audio(
             return {"success": False, "transcript": "",
                     "error": "CAF audio could not be converted to WAV."}
 
+    # Quiet speech must be normalized before silence trimming. Otherwise the
+    # default -40 dB silence gate can classify whispered words as silence and
+    # permanently remove them before the provider sees the file.
+    policy_cleanup_dir: Optional[str] = None
+    if provider == "openai":
+        openai_cfg = stt_config.get("openai") or {}
+        policy_work_dir = tempfile.mkdtemp(prefix="hermes-openai-stt-input-")
+        normalized = _prepare_openai_audio_for_policy(
+            file_path, policy_work_dir, openai_cfg
+        )
+        if normalized != file_path:
+            file_path = normalized
+            policy_cleanup_dir = policy_work_dir
+        else:
+            shutil.rmtree(policy_work_dir, ignore_errors=True)
+
     # Pre-upload silence trim for built-in cloud providers: local whisper gets
     # Silero VAD, cloud endpoints get the raw file — collapse long pauses
     # client-side so silence isn't uploaded, billed, or hallucinated on.
@@ -3016,6 +3183,8 @@ def _transcribe_prepared_audio(
     finally:
         if trim_cleanup_dir:
             shutil.rmtree(trim_cleanup_dir, ignore_errors=True)
+        if policy_cleanup_dir:
+            shutil.rmtree(policy_cleanup_dir, ignore_errors=True)
 
 
 def _dispatch_stt_provider(
@@ -3082,8 +3251,12 @@ def _dispatch_stt_provider(
     if provider == "openai":
         openai_cfg = stt_config.get("openai") or {}
         model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
-        return _transcribe_openai(
-            file_path, model_name, language=language, prompt=prompt,
+        return _transcribe_openai_with_policy(
+            file_path,
+            model_name,
+            openai_cfg,
+            language=language,
+            prompt=prompt,
         )
 
     if provider == "mistral":

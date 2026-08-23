@@ -132,6 +132,47 @@ class TestProviderGating:
         # Dispatcher owns the cleanup of the trim temp dir.
         assert not trimmed_dir.exists()
 
+    def test_openai_normalizes_before_silence_trim(self, tmp_path):
+        wav = _write_wav(tmp_path / "quiet.wav", [("tone", 1)])
+        seen = []
+
+        def fake_prepare(file_path, work_dir, config):
+            normalized = str(Path(work_dir) / "quiet-normalized.m4a")
+            seen.append(("normalize", file_path, normalized))
+            return normalized
+
+        def fake_trim(file_path, config):
+            seen.append(("trim", file_path))
+            return None
+
+        def fake_openai_policy(file_path, model_name, config, **kwargs):
+            seen.append(("transcribe", file_path, model_name))
+            return {"success": True, "transcript": "complete", "provider": "openai"}
+
+        config = {
+            "provider": "openai",
+            "enabled": True,
+            "openai": {"model": "gpt-transcribe", "normalize_quiet_audio": True},
+        }
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="openai"), \
+             patch("tools.transcription_tools._prepare_openai_audio_for_policy",
+                   side_effect=fake_prepare), \
+             patch("tools.transcription_tools._trim_silence_for_cloud_stt",
+                   side_effect=fake_trim), \
+             patch("tools.transcription_tools._transcribe_openai_with_policy",
+                   side_effect=fake_openai_policy):
+            from tools.transcription_tools import _transcribe_prepared_audio
+            result = _transcribe_prepared_audio(wav)
+
+        assert result["success"] is True
+        normalized_path = seen[0][2]
+        assert seen == [
+            ("normalize", wav, normalized_path),
+            ("trim", normalized_path),
+            ("transcribe", normalized_path, "gpt-transcribe"),
+        ]
+
     def test_trim_returning_none_uploads_original(self, tmp_path):
         wav = _write_wav(tmp_path / "a.wav", [("tone", 1)])
         seen = {}
