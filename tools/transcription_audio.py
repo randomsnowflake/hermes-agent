@@ -8,8 +8,11 @@ best-effort cloud pre-upload silence trim. Facade-owned state (``_HAS_PILK``,
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -21,7 +24,7 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from utils import is_truthy_value
 from tools.transcription_common import (
     COMMON_LOCAL_BIN_DIRS, LOCAL_NATIVE_AUDIO_FORMATS, MAX_FILE_SIZE, SUPPORTED_FORMATS,
-    _config_number, _error_result, _lazy_ensure_quietly, _process_error_detail)
+    _config_float, _config_number, _error_result, _lazy_ensure_quietly, _process_error_detail)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("tools.transcription_tools")
@@ -79,6 +82,52 @@ def _transcode_audio_for_stt(file_path: str, work_dir: str) -> tuple[Optional[st
     except Exception as exc:  # noqa: BLE001 - transcode is best-effort
         logger.error("unexpected STT transcode failure for %s: %s", file_path, exc, exc_info=True)
         return None, f"failed to transcode audio for the STT API: {exc}"
+
+
+def _measure_integrated_loudness(file_path: str) -> Optional[float]:
+    """Return EBU R128 integrated loudness via ffmpeg's loudnorm analysis."""
+    ffmpeg = _find_ffmpeg_binary()
+    if not ffmpeg:
+        return None
+    try:
+        completed = _run_quiet([
+            ffmpeg, "-hide_banner", "-nostats", "-i", file_path,
+            "-af", "loudnorm=I=-16:LRA=11:TP=-1.5:print_format=json",
+            "-f", "null", "-",
+        ], timeout=120)
+        matches = re.findall(r'\{\s*"input_i".*?\}', completed.stderr, re.DOTALL)
+        return float(json.loads(matches[-1])["input_i"]) if matches else None
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError) as exc:
+        logger.warning("Could not measure STT input loudness for %s: %s", file_path, exc)
+        return None
+
+
+def _prepare_openai_audio_for_policy(
+    file_path: str, work_dir: str, openai_config: Dict[str, Any],
+) -> str:
+    """Normalize unusually quiet OpenAI input; silence and failures keep the original."""
+    if not is_truthy_value(openai_config.get("normalize_quiet_audio", False)):
+        return file_path
+    threshold = min(-12.0, max(-60.0, _config_float(
+        openai_config, "quiet_threshold_lufs", -32.0)))
+    target = min(-12.0, max(-24.0, _config_float(
+        openai_config, "normalization_target_lufs", -16.0)))
+    measured = _measure_integrated_loudness(file_path)
+    if measured is None or not math.isfinite(measured) or measured >= threshold:
+        return file_path
+    ffmpeg = _find_ffmpeg_binary()
+    if not ffmpeg:
+        return file_path
+    output_path = os.path.join(work_dir, f"{Path(file_path).stem or 'audio'}-normalized.m4a")
+    try:
+        _run_ffmpeg_stt_encode(ffmpeg, file_path, output_path,
+                               audio_filter=f"loudnorm=I={target:.1f}:LRA=11:TP=-1.5")
+        logger.info("Normalized quiet STT input %s from %.1f LUFS toward %.1f LUFS",
+                    Path(file_path).name, measured, target)
+        return output_path
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("Quiet-audio normalization failed for %s: %s", file_path, exc)
+        return file_path
 
 
 def _validate_audio_file_size(audio_path: Path, *, enforce_size_limit: bool = True) -> Optional[Dict[str, Any]]:
