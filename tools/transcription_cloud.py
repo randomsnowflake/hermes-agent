@@ -17,10 +17,10 @@ from typing import Any, Callable, Dict, Optional
 from urllib.parse import urljoin
 
 from utils import is_truthy_value
-from tools.transcription_audio import _transcode_audio_for_stt
+from tools.transcription_audio import _probe_audio_duration, _transcode_audio_for_stt
 from tools.transcription_common import (
     DEFAULT_GROQ_STT_MODEL, DEFAULT_STT_MODEL, ELEVENLABS_STT_BASE_URL, GROQ_BASE_URL, GROQ_MODELS,
-    OPENAI_BASE_URL, OPENAI_MODELS, XAI_STT_BASE_URL, _error_result, _get_stt_section,
+    OPENAI_BASE_URL, OPENAI_MODELS, XAI_STT_BASE_URL, _config_float, _error_result, _get_stt_section,
     _lazy_ensure_quietly, _log_prompt_unsupported, _ok_result)
 
 # Log-record parity with the origin module.
@@ -163,6 +163,54 @@ def _transcribe_openai(
                     Path(file_path).name, provider_label, model_name, len(transcript_text))
         return _ok_result(transcript_text, provider_label)
     return _with_openai_client(api_key, base_url, file_path, provider_label, _run)
+
+
+_UNSEGMENTED_SCRIPT_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]"
+)
+
+
+def _transcript_density_units(transcript: str) -> int:
+    """Count words plus characters from commonly unsegmented CJK scripts."""
+    unsegmented_characters = len(_UNSEGMENTED_SCRIPT_RE.findall(transcript))
+    segmented_text = _UNSEGMENTED_SCRIPT_RE.sub(" ", transcript)
+    return len(re.findall(r"\b\w+\b", segmented_text, re.UNICODE)) + unsegmented_characters
+
+
+def _transcribe_openai_with_policy(
+    file_path: str, model_name: str, openai_config: Dict[str, Any], *,
+    language: Optional[str] = None, prompt: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Retry failed/sparse OpenAI results once; keep the more complete successful result."""
+    # The dispatcher owns the live backend binding (also the existing test seam).
+    from tools.transcription_tools import _transcribe_openai
+
+    primary = _transcribe_openai(file_path, model_name, language=language, prompt=prompt)
+    fallback_model = str(openai_config.get("fallback_model") or "").strip()
+    if not fallback_model or fallback_model == model_name:
+        return primary
+    should_retry = not primary.get("success")
+    if primary.get("success"):
+        duration = _probe_audio_duration(file_path)
+        minimum_duration = max(0.0, _config_float(openai_config, "retry_min_audio_seconds", 10.0))
+        minimum_rate = max(0.0, _config_float(openai_config, "retry_min_words_per_second", 0.0))
+        density_units = _transcript_density_units(str(primary.get("transcript") or ""))
+        should_retry = bool(duration and duration >= minimum_duration and minimum_rate > 0
+                            and density_units / duration < minimum_rate)
+        if should_retry:
+            logger.warning("Sparse OpenAI STT result from %s: %d density units for %.1fs; retrying with %s",
+                           model_name, density_units, duration, fallback_model)
+    if not should_retry:
+        return primary
+    fallback = _transcribe_openai(file_path, fallback_model, language=language, prompt=prompt)
+    if not fallback.get("success"):
+        return primary
+    primary_units = _transcript_density_units(str(primary.get("transcript") or ""))
+    fallback_units = _transcript_density_units(str(fallback.get("transcript") or ""))
+    if not primary.get("success") or fallback_units > primary_units:
+        fallback["recovered_with_model"] = fallback_model
+        return fallback
+    return primary
 
 
 def _transcribe_mistral(

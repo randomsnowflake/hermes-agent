@@ -12,6 +12,7 @@ the dispatcher and the cached local model + idle-unload state; backends live in
 import logging
 import os
 import shutil
+import tempfile
 import threading
 import time
 import importlib.util as _ilu
@@ -25,7 +26,8 @@ from tools.transcription_common import (
     DEFAULT_STT_MODEL, LOCAL_STT_COMMAND_ENV, LOCAL_STT_LANGUAGE_ENV, _error_result,
     _get_stt_section, _ok_result)
 from tools.transcription_audio import (
-    _convert_caf_to_wav, _prepare_audio_for_transcription, _trim_silence_for_cloud_stt,
+    _convert_caf_to_wav, _prepare_audio_for_transcription, _prepare_openai_audio_for_policy,
+    _trim_silence_for_cloud_stt,
     _validate_audio_file, _validate_audio_file_size, _validate_audio_source_file)
 from tools.transcription_local import (
     _get_idle_unload_seconds, _has_local_command, _join_confident_segments,
@@ -35,7 +37,7 @@ from tools.transcription_local import (
 from tools.transcription_cloud import (  # noqa: F401  (handlers dispatched via globals())
     _has_xai_stt_credentials, _resolve_openai_audio_client_config, _transcribe_deepinfra,
     _transcribe_elevenlabs, _transcribe_groq, _transcribe_mistral, _transcribe_openai,
-    _transcribe_xai)
+    _transcribe_openai_with_policy, _transcribe_xai)
 from tools.transcription_command import (
     _apply_pre_transcription_hook, _dispatch_to_plugin_provider, _enforce_prompt_length_limit,
     _resolve_command_stt_provider_config, _transcribe_command_stt, _unregistered_stt_provider_error)
@@ -411,18 +413,25 @@ def _transcribe_prepared_audio(
             file_path = _convert_caf_to_wav(file_path)
             if not file_path:
                 return _error_result("CAF audio could not be converted to WAV.")
-    # Best-effort pre-upload silence trim for built-in cloud providers.
+    # Normalize before the silence gate can discard quiet spoken words.
+    policy_temp_dir: Optional[tempfile.TemporaryDirectory] = None
     trim_cleanup_dir: Optional[str] = None
-    if provider in CLOUD_STT_PROVIDERS:
-        trimmed = _trim_silence_for_cloud_stt(file_path, stt_config)
-        if trimmed:
-            file_path = trimmed
-            trim_cleanup_dir = os.path.dirname(trimmed)
     try:
+        if provider == "openai":
+            policy_temp_dir = tempfile.TemporaryDirectory(prefix="hermes-openai-stt-input-")
+            file_path = _prepare_openai_audio_for_policy(
+                file_path, policy_temp_dir.name, _get_stt_section(stt_config, "openai"))
+        if provider in CLOUD_STT_PROVIDERS:
+            trimmed = _trim_silence_for_cloud_stt(file_path, stt_config)
+            if trimmed:
+                file_path = trimmed
+                trim_cleanup_dir = os.path.dirname(trimmed)
         return _dispatch_stt_provider(file_path, provider, stt_config, model, source)
     finally:
         if trim_cleanup_dir:
             shutil.rmtree(trim_cleanup_dir, ignore_errors=True)
+        if policy_temp_dir is not None:
+            policy_temp_dir.cleanup()
 
 
 # Built-in provider -> (stt section, config key, default, treat-empty-as-missing). "local_command"
@@ -465,6 +474,10 @@ def _dispatch_stt_provider(
         # Looked up in this module at call time so tests may patch ``_transcribe_*``.
         handler = globals()[f"_transcribe_{provider}"]
         model_name = _builtin_model_name(provider, stt_config, model)
+        if provider == "openai":
+            return _transcribe_openai_with_policy(
+                file_path, model_name, _get_stt_section(stt_config, "openai"),
+                language=language, prompt=prompt)
         if provider in ("local", "local_command"):
             model_name = _normalize_local_model(model_name)
         return handler(file_path, model_name, language=language, prompt=prompt)
