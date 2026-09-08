@@ -83,3 +83,8 @@ def _config_number(cfg: Dict[str, Any], key: str, default, cast=float):
         return cast(cfg.get(key, default))
     except (TypeError, ValueError):
         return default
+
+
+def _config_float(cfg: Dict[str, Any], key: str, default: float) -> float:
+    """Policy thresholds are numbers, not YAML booleans."""
+    return default if isinstance(cfg.get(key), bool) else _config_number(cfg, key, default)
