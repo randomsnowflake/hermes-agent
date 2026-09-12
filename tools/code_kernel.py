@@ -313,6 +313,7 @@ class SessionKernel:
         self.death_pipe_w: Optional[int] = None
         self.tool_call_log: List = []
         self.tool_call_counter: List[int] = [0]
+        self.max_tool_calls: int = 0
         # Cells currently attached (bumped under the registry lock on selection, dropped when the
         # cell settles). Reaping/cap-eviction skip attached kernels: tearing one down mid-spawn
         # rmtree'd the staging dir under the spawner and killed live cells.
@@ -447,8 +448,7 @@ def shutdown_kernels_for_owner(owner: str) -> None:
 atexit.register(shutdown_all_kernels)
 
 
-def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
-                 sandbox_tools: frozenset) -> None:
+def _rpc_forever(kernel: SessionKernel, sandbox_tools: frozenset) -> None:
     """Serve tool RPC for the kernel's whole life: ``_rpc_server_loop`` returns on disconnect or
     its 300s idle timeout, and a kernel idles longer between cells, so re-accept until teardown
     (the client stub reconnects: HERMES_RPC_PERSISTENT). The serving thread carries NO frozen
@@ -462,7 +462,7 @@ def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
         return authority.dispatch(tool_name, tool_args)
     while not kernel.stop_event.is_set():
         _rpc_server_loop(kernel.server_sock, "", kernel.tool_call_log, kernel.tool_call_counter,
-                         max_tool_calls, sandbox_tools, kernel.stop_event, kernel.rpc_token,
+                         lambda: kernel.max_tool_calls, sandbox_tools, kernel.stop_event, kernel.rpc_token,
                          dispatch=_dispatch)
 
 
@@ -620,7 +620,8 @@ def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
             os.close(death_r)
     # Deliberately NOT propagate_context_to_thread: that would freeze the spawning cell's
     # context/callbacks into the server thread for life. Authority is rebound per cell.
-    for target, args in ((_rpc_forever, (kernel, max_tool_calls, sandbox_tools)),
+    kernel.max_tool_calls = max_tool_calls
+    for target, args in ((_rpc_forever, (kernel, sandbox_tools)),
                          (_stdout_reader, (kernel,)), (_stderr_reader, (kernel,))):
         threading.Thread(target=target, args=args, daemon=True).start()
 
@@ -779,6 +780,7 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
             assert kernel.proc is not None and kernel.proc.stdin is not None
             # Per-cell tool budget: the RPC loop enforces counter < max; reset without restarting.
             kernel.tool_call_counter[0] = 0
+            kernel.max_tool_calls = max_tool_calls
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
             kernel.cell_authority = authority
             kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code}) + "\n").encode("utf-8"))

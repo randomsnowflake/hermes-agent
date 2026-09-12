@@ -1047,6 +1047,7 @@ class SessionSessionsMixin:
             AND COALESCE(child.source, '') != 'tool'
         """
 
+        preview_lookup = "FROM messages m WHERE m.session_id = tip.id"
         query = f"""
             WITH RECURSIVE
             recent_candidates(id) AS (
@@ -1120,8 +1121,7 @@ class SessionSessionsMixin:
                 rt.activity AS last_active,
                 COALESCE(
                     (SELECT {_PREVIEW_RAW_SELECT}
-                     FROM messages m
-                     WHERE m.session_id = tip.id
+                     {preview_lookup}
                        AND m.role = 'user'
                        AND m.content IS NOT NULL
                        AND {_PREVIEW_ELIGIBLE_SQL}
@@ -1161,7 +1161,26 @@ class SessionSessionsMixin:
             with self._read_ctx() as conn:
                 conn.set_progress_handler(_deadline_progress_handler, 1000)
                 try:
-                    rows = conn.execute(query, params).fetchall()
+                    try:
+                        rows = conn.execute(query, params).fetchall()
+                    except sqlite3.DatabaseError as exc:
+                        if getattr(exc, "sqlite_errorcode", 0) & 0xFF != sqlite3.SQLITE_CORRUPT:
+                            raise
+                        # A covering session index can contain dangling rowids.
+                        # Enumerate candidates there, but fetch preview payloads
+                        # only through the table's primary key. NOT INDEXED keeps
+                        # SQLite from choosing the damaged non-covering path again;
+                        # the IN constraint avoids a whole-message-table scan.
+                        # Retry once, under the ORIGINAL progress deadline. This
+                        # bypasses dangling entries, not table/index-page damage.
+                        logger.warning("Recent-session browse hit SQLITE_CORRUPT; retrying previews by primary key")
+                        fallback_query = query.replace(preview_lookup, """
+                            FROM messages m NOT INDEXED
+                            WHERE m.id IN (
+                                SELECT id FROM messages WHERE session_id = tip.id
+                            ) AND m.session_id = tip.id
+                        """)
+                        rows = conn.execute(fallback_query, params).fetchall()
                 finally:
                     conn.set_progress_handler(None, 0)
         except sqlite3.OperationalError as exc:
