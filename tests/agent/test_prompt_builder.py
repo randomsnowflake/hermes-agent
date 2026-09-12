@@ -311,7 +311,34 @@ class TestBuildSkillsSystemPrompt:
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
 
+    @pytest.mark.parametrize("compact", [False, True])
+    def test_skill_selection_is_material_and_preserves_discovery(
+        self, monkeypatch, tmp_path, compact
+    ):
+        """The emitted policy narrows loading, not the visible skill catalog."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "task-owner"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: task-owner\ndescription: Own this workflow\n---\n"
+            "Private workflow body, loaded only on demand.\n"
+        )
+        kwargs = {"compact_categories": frozenset({"tools"})} if compact else {}
+        result = build_skills_system_prompt(**kwargs)
+        guidance, catalog = result.split("<available_skills>", 1)
+        catalog, after = catalog.split("</available_skills>", 1)
 
+        # These are policy requirements in the runtime output, not a full-text snapshot.
+        assert "materially" in guidance
+        assert "narrowest" in guidance
+        assert "dependencies" in guidance and "condition" in guidance
+        assert "safety" in guidance and "skill_view(name)" in guidance
+        assert "without loading" in after and "materially" in after
+        for eager_rule in ("even partially relevant", "Err on the side", "genuinely none"):
+            assert eager_rule not in result
+        assert "task-owner" in catalog
+        assert "Private workflow body" not in result
+        assert build_skills_system_prompt(**kwargs) == result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

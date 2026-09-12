@@ -102,9 +102,10 @@ would do or plan to do without actually doing it.
 - GitHub: alice-dev
 
 # Layer 7: Skills index
-## Skills (mandatory)
-Before replying, scan the skills below. If one clearly matches
-your task, load it with skill_view(name) and follow its instructions.
+## Skills
+Before replying, scan the skills below. Load a skill with skill_view(name)
+when it materially improves correctness, safety, or execution of the task.
+Choose the narrowest workflow owner; load dependencies only as needed.
 ...
 <available_skills>
   software-development:
@@ -287,6 +288,16 @@ Long files are truncated before injection.
 ## Skills index
 
 The skills system contributes a compact skills index to the prompt when skills tooling is available.
+The selection policy is based on material usefulness to the current task, not partial topic overlap:
+start with the narrowest skill that owns the workflow, then load additional skills, dependencies,
+or references only when their stated condition is met or they provide a distinct necessary
+capability for the current step. Applicable safety instructions and required prerequisites still
+apply; using familiar basic tools does not remove the value of task-specific conventions.
+If no skill would materially help, the agent can proceed without loading one.
+
+This changes loading guidance, not catalog discovery: visible entries remain listed, including
+names-only entries in compact categories. Skill bodies are loaded on demand through `skill_view`.
+The index remains cached; this policy does not rebuild a conversation's system prompt mid-turn.
 
 ## Supported prompt customization surfaces
 
