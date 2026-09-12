@@ -1317,15 +1317,14 @@ def _render_skills_index(
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
     return (
         "## Skills\n"
-        "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
-        "task, you MUST load it with skill_view(name) and follow its instructions. Err on the side of "
-        "loading — it is always better to have context you don't need than to miss critical steps, pitfalls, "
-        "or established workflows. Skills contain specialized knowledge — API endpoints, tool-specific "
-        "commands, and proven workflows that outperform general-purpose approaches. Load the skill "
-        f"even if you think you could handle the task with basic tools like {_basic_tools}. "
-        "Skills also encode the user's preferred approach, conventions, and quality standards for tasks like "
-        "code review, planning, and testing — load them even for tasks you already know how to do, because "
-        "the skill defines how it should be done here.\n"
+        "Before replying, scan the skills below. Load a skill with skill_view(name) and follow its "
+        "instructions when it materially improves correctness, safety, or execution of the current task. "
+        "Choose the narrowest skill that owns the workflow; broad topic overlap alone is not enough. "
+        "Skills can supply specialized commands, proven workflows, and the user's conventions even "
+        f"when you already know how to use basic tools like {_basic_tools}. "
+        "Load additional skills or dependencies only when their stated condition is met or they supply "
+        "a distinct, necessary capability for the current step; do not load every related skill or "
+        "reference preemptively. Do not skip applicable safety instructions or required prerequisites.\n"
         "If a skill has issues, fix it with skill_manage(action='patch').\n"
         "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
         "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
@@ -1333,7 +1332,7 @@ def _render_skills_index(
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
-        "Only proceed without loading a skill if genuinely none are relevant to the task."
+        "Proceed without loading a skill when none would materially help the current task."
         + hidden_note
     )
 
