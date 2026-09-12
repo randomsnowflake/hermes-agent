@@ -14,6 +14,7 @@ import shlex
 import socket
 import threading
 import time
+from typing import Callable
 
 from agent.thread_scoped_output import thread_scoped_silence
 from tools.registry import tool_error
@@ -68,12 +69,13 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
 
 
 def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: list,
-                     tool_call_counter: list, max_tool_calls: int, allowed_tools: frozenset,
+                     tool_call_counter: list, max_tool_calls: int | Callable[[], int], allowed_tools: frozenset,
                      stop_event: threading.Event, rpc_token: str, dispatch=None):
     """Accept one client and serve newline-delimited JSON requests until it disconnects, idles
     300s, or the call limit is reached. ``tool_call_counter`` is a mutable ``[int]``. ``dispatch``
     overrides how an allowed, budgeted call runs: per-call sandboxes use the default (the thread
     carries the cell's context); session kernels rebind each call to the CURRENT cell's authority.
+    ``max_tool_calls`` may be a callable so persistent connections use the current cell's limit.
     """
     if dispatch is None:
         dispatch = _default_dispatch(task_id)
@@ -111,7 +113,8 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
                 else:
                     resp = _handle_rpc_request(
                         request, allowed_tools=allowed_tools, tool_call_counter=tool_call_counter,
-                        max_tool_calls=max_tool_calls, dispatch=dispatch, tool_call_log=tool_call_log,
+                        max_tool_calls=max_tool_calls() if callable(max_tool_calls) else max_tool_calls,
+                        dispatch=dispatch, tool_call_log=tool_call_log,
                         call_start=call_start, where="sandbox",
                     ) if _rpc_token_ok(request, rpc_token) else tool_error("Unauthorized RPC request")
                 conn.sendall((resp + "\n").encode())

@@ -2492,6 +2492,7 @@ def _machine_id() -> str:
 
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False, return_job: bool = False,
+    manual: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2500,7 +2501,8 @@ def claim_job_for_fire(
     stale callback cannot resurrect a paused job). Lose if a claim younger than
     ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
-    ``next_run_at`` so a stale re-delivery cannot re-fire."""
+    ``next_run_at`` so a stale re-delivery cannot re-fire. ``manual`` excludes this attempt
+    from scheduled-occurrence dedupe without bypassing the paused or live-claim guards."""
     def apply(jobs, _i, job):
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
@@ -2513,8 +2515,8 @@ def claim_job_for_fire(
             return False  # someone holds a fresh claim
         from cron.occurrences import completed_occurrence, scheduled_instant
 
-        manual = force or job.get("manual_run_at") == job.get("next_run_at")
-        instant = None if manual else scheduled_instant(job.get("next_run_at"))
+        manual_run = manual or force or job.get("manual_run_at") == job.get("next_run_at")
+        instant = None if manual_run else scheduled_instant(job.get("next_run_at"))
         if instant and completed_occurrence(job, instant):
             if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
