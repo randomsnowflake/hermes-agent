@@ -1065,9 +1065,19 @@ class LocalEnvironment(BaseEnvironment):
         if login:
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+        # Foreground commands need the same cgroup boundary as background workers:
+        # MemoryHigh throttles the whole messaging gateway, not just the heavy child.
+        from uuid import uuid4
+        from tools.process_registry import restart_safe_gateway_child_argv, systemd_user_bus_env
+
+        dispatch = restart_safe_gateway_child_argv(
+            args, unit_suffix=f"terminal-{uuid4().hex}", require_restart_safe_scope=True)
+        run_env = _make_run_env(self.env)
+        if dispatch.mode == "scoped":
+            run_env = systemd_user_bus_env(run_env)
         self._recover_cwd()
         proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            dispatch.argv, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,
