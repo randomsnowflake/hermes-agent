@@ -157,7 +157,7 @@ class MattermostAdapter(BasePlatformAdapter):
                     logger.error("MM API %s %s → %s: %s", method, path, resp.status, body[:200])
                     return {}
                 return await resp.json()
-        except aiohttp.ClientError as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if is_post:
                 self._last_post_error = str(exc)
             logger.error("MM API %s %s network error: %s", method, path, exc)
@@ -590,11 +590,22 @@ class MattermostAdapter(BasePlatformAdapter):
             chat_id=channel_id, chat_type=_CHANNEL_TYPE_MAP.get(data.get("channel_type", "O"), "channel"),
             user_id=sender_id, user_name=data.get("sender_name", "").lstrip("@") or sender_id,
             thread_id=thread_id, message_id=post_id)
+        # Reports sent outside this conversation are absent from its transcript.
+        parent: Dict[str, Any] = {}
+        root_id = post.get("root_id") or ""
+        if re.fullmatch(r"[a-z0-9]{26}", root_id) and msg_type != MessageType.COMMAND:
+            parent = await self._api_get(f"posts/{root_id}")
+            if (parent.get("id") != root_id or parent.get("channel_id") != channel_id
+                    or parent.get("delete_at")):
+                parent = {}
         from gateway.platforms.base import resolve_channel_prompt
         await self.handle_message(MessageEvent(
             text=message_text, message_type=msg_type, source=source, raw_message=post, message_id=post_id,
             media_urls=media_urls or None, media_types=media_types or None,
-            channel_prompt=resolve_channel_prompt(self.config.extra, channel_id, None)))
+            channel_prompt=resolve_channel_prompt(self.config.extra, channel_id, None),
+            reply_to_message_id=parent.get("id"), reply_to_text=parent.get("message") or None,
+            reply_to_author_id=parent.get("user_id"),
+            reply_to_is_own_message=bool(parent) and parent.get("user_id") == self._bot_user_id))
 
 
 # --- Plugin standalone-send (out-of-process cron delivery via Mattermost REST) ---
