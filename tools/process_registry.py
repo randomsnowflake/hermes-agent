@@ -343,6 +343,21 @@ def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[s
     return _systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv)
 
 
+def foreground_scope_argv(argv: list[str], env: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """Wrap a foreground terminal command in its own transient scope under the supervised gateway.
+
+    Background workers already get one (``_scope_argv``); foreground ``LocalEnvironment._run_bash``
+    commands did not, so one heavy lint/test run could push the gateway cgroup past MemoryHigh and
+    stall every chat. ``--scope`` execs in place, so PID/PGID, stdin and kill semantics are unchanged.
+    Falls back to the unwrapped command when no user scope can be created."""
+    if not (_IS_LINUX and _is_supervised_gateway_process() and _systemd_run_user_scope_available()):
+        return argv, env
+    scoped = _build_systemd_scope_argv(argv, unit_suffix=f"fg-{os.getpid()}-{uuid.uuid4().hex[:12]}")
+    if scoped == argv:
+        return argv, env
+    return scoped, systemd_user_bus_env(env)
+
+
 _scope_degraded_warned = False
 
 
