@@ -3,6 +3,8 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
+
 from cron import scheduler
 from cron import scheduler_preflight as sched_preflight
 import gateway.run as gateway_run
@@ -159,6 +161,37 @@ def test_multiplex_housekeeping_uses_primary_routes_for_credentialless_satellite
         ("routed", root_adapters, ["route-to-secondary"]),
         ("drain", routed),
     ]
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_drain_local_adapter_does_not_mask_shared_routes(tmp_path, monkeypatch, native):
+    from gateway.config import Platform
+    from gateway.profile_routing import ProfileRoute
+
+    primary = object()
+    shared = {Platform.DISCORD: primary}
+    secondary = {Platform.LOCAL: object()}
+    if native:
+        secondary[Platform.DISCORD] = object()
+    runner = SimpleNamespace(_profile_adapters={"secondary": secondary})
+    monkeypatch.setattr(gateway_run, "_handoff_watch_scopes",
+                        lambda _r: [("secondary", tmp_path)])
+    monkeypatch.setattr(sched_preflight, "_primary_profile_routes_for_current_home",
+                        lambda: [ProfileRoute(name="test", platform="discord", chat_id="allowed", profile="secondary")])
+    captured = []
+    monkeypatch.setattr(scheduler, "drain_delivery_queue", lambda adapters, loop: captured.append(adapters))
+
+    gateway_run._drain_restart_safe_cron_deliveries(shared, object(), runner)
+
+    assert len(captured) == 1
+    selected = captured[0]
+    if native:
+        assert selected is secondary
+    else:
+        assert isinstance(selected, sched_preflight.SharedRouteAdapters)
+        assert selected.get(Platform.DISCORD, {"chat_id": "allowed"}) is primary
+        assert selected.get(Platform.DISCORD, {"chat_id": "other"}) is None
+        assert selected.get(Platform.DISCORD) is None
 
 
 def test_primary_drain_delivers_credentialless_satellite_queue_row_through_primary_adapter(
