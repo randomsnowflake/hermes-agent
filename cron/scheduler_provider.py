@@ -546,6 +546,8 @@ class InProcessCronScheduler(CronScheduler):
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
 
+        from gateway.config import Platform
+
         initial_homes = _existing_profile_homes(profile_homes)
         register_ticked_homes([_profile_entry(entry)[1] for entry in initial_homes])
         logger.info(
@@ -562,7 +564,7 @@ class InProcessCronScheduler(CronScheduler):
             if profile_name is None or profile_name == default_profile:
                 return adapters
             tick_adapters = (profile_adapters or {}).get(profile_name) or {}
-            if not tick_adapters and adapters:
+            if not any(p != Platform.LOCAL for p in tick_adapters) and adapters:
                 return SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
             return tick_adapters
 

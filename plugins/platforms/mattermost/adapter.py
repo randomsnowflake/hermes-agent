@@ -24,6 +24,7 @@ from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.helpers import cancel_task
 from gateway.platforms.base import gateway_trust_env, BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.send_targets import regex_groups_parser
 from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, env_is_connected as _env_is_connected,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -745,6 +746,9 @@ def register(ctx) -> None:
         install_hint="pip install aiohttp", setup_fn=interactive_setup,
         apply_yaml_config_fn=_apply_yaml_config,  # YAML→env bridge (see _YAML_BRIDGE)
         cron_deliver_env_var="MATTERMOST_HOME_CHANNEL",
+        # Native channel[:root-post] IDs; otherwise cron sends the colon-joined
+        # value as channel_id and Mattermost rejects it with a misleading 403.
+        target_ref_syntax_fn=regex_groups_parser(re.compile(r"([a-z0-9]{26})(?::([a-z0-9]{26}))?")),
         standalone_sender_fn=_standalone_send,  # out-of-process cron; without it `deliver=mattermost` fails
         max_message_length=MAX_POST_LENGTH, emoji="💬", allow_update_command=True,
         platform_hint=_PLATFORM_HINT,
