@@ -20,6 +20,8 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
@@ -706,6 +708,34 @@ def test_multiplex_connected_secondary_uses_its_own_adapters(tmp_path):
     )
     assert default_ad is shared
     assert sec_ad is sec
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_multiplex_local_adapter_does_not_mask_shared_routes(tmp_path, monkeypatch, native):
+    from cron.scheduler_preflight import SharedRouteAdapters
+    from gateway.config import Platform
+    from gateway.profile_routing import ProfileRoute
+
+    primary = object()
+    shared = {Platform.DISCORD: primary}
+    secondary = {Platform.LOCAL: object()}
+    if native:
+        secondary[Platform.DISCORD] = object()
+    monkeypatch.setattr(
+        "cron.scheduler_preflight._primary_profile_routes_for_current_home",
+        lambda: [ProfileRoute(name="test", platform="discord", chat_id="allowed", profile="home-ops")],
+    )
+    default_ad, sec_ad = _run_multiplex_capture(
+        tmp_path, profile_adapters={"home-ops": secondary}, shared_adapters=shared,
+    )
+    assert default_ad is shared
+    if native:
+        assert sec_ad is secondary
+    else:
+        assert isinstance(sec_ad, SharedRouteAdapters)
+        assert sec_ad.get(Platform.DISCORD, {"chat_id": "allowed"}) is primary
+        assert sec_ad.get(Platform.DISCORD, {"chat_id": "other"}) is None
+        assert sec_ad.get(Platform.DISCORD) is None
 
 
 def test_multiplex_empty_secondary_does_not_fall_back_to_shared(tmp_path):
