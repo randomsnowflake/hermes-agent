@@ -7,8 +7,9 @@ from cron.scheduler_delivery import _resolve_delivery_targets
 from tools.send_message_targets import _parse_target_ref, resolve_send_target
 from tools.send_message_tool import prepare_send_message_platforms
 
-CHANNEL = "kzaxbkroy3bajcn4wkgn48f81o"
-THREAD = "nw63hcukfjntde5ebxip1efk8a"
+# Synthetic 26-character lowercase alphanumeric IDs, not real conversations.
+CHANNEL = "channel" + "a" * 19
+THREAD = "thread" + "b" * 20
 
 
 @pytest.fixture(autouse=True)
