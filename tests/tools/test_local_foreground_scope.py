@@ -31,6 +31,7 @@ def mock_spawn(monkeypatch):
     """Exercise argv wiring without discovering shells, credentials or a live bus."""
     monkeypatch.setattr(local, "_find_bash", lambda: "/bin/bash")
     monkeypatch.setattr(local, "_make_run_env", lambda env: {"TEST_CHILD": "1"})
+    monkeypatch.setattr(local, "own_process_groups", lambda groups: None)
     with patch("tools.environments.local.subprocess.Popen") as popen:
         popen.return_value.pid = os.getpid()
         yield popen
