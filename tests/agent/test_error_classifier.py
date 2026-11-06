@@ -1884,6 +1884,61 @@ class TestExpandedOverflowPatterns:
         assert result.reason == FailoverReason.context_overflow
 
 
+class TestCodexOpaqueBadRequest:
+    @pytest.mark.parametrize("approx_tokens,num_messages", [(100, 1), (73414, 17), (200000, 103)])
+    def test_exact_codex_envelope_retries_without_compressing(self, approx_tokens, num_messages):
+        error = MockAPIError("Error code: 400 - {'detail': 'Bad Request'}", status_code=400,
+                             body={"detail": "Bad Request"})
+        result = classify_api_error(error, provider="openai-codex", model="gpt-6.1-sol",
+                                    approx_tokens=approx_tokens, context_length=272000,
+                                    num_messages=num_messages)
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable
+        assert not result.should_compress
+        assert not result.should_rotate_credential
+        assert not result.should_fallback
+
+    @pytest.mark.parametrize("provider,body", [
+        ("openai", {"detail": "Bad Request"}),
+        ("custom", {"detail": "Bad Request"}),
+        ("openai-codex", {"detail": "Bad Request: invalid input"}),
+        ("openai-codex", {"detail": "Bad Request", "code": "invalid_parameter"}),
+        ("openai-codex", {"error": {"message": "Bad Request", "code": "invalid_parameter"}}),
+    ])
+    def test_other_400s_keep_failing_fast(self, provider, body):
+        error = MockAPIError(f"Error code: 400 - {body}", status_code=400, body=body)
+        result = classify_api_error(error, provider=provider)
+        assert result.reason == FailoverReason.format_error
+        assert not result.retryable
+
+    def test_production_settlement_uses_existing_backoff_not_terminal_path(self):
+        from unittest.mock import MagicMock, patch
+        from agent.turn_api_error import settle_unrecovered_error
+        from agent.turn_retry_state import TurnRetryState
+
+        error = MockAPIError("Error code: 400 - {'detail': 'Bad Request'}", status_code=400,
+                             body={"detail": "Bad Request"})
+        agent = MagicMock()
+        retry = TurnRetryState()
+        with patch("agent.turn_api_error.compute_error_backoff", return_value=1) as backoff, \
+                patch("agent.turn_api_error.interruptible_backoff_sleep", return_value=None) as sleep:
+            verdict = settle_unrecovered_error(
+                agent, api_error=error, classified=classify_api_error(error, provider="openai-codex"),
+                _retry=retry, status_code=400, error_msg=str(error), is_context_length_error=False,
+                is_rate_limited=False, _is_zai_coding_overload=False, _provider="openai-codex",
+                _base="https://chatgpt.com/backend-api/codex", _model="gpt-6.1-sol", messages=[],
+                api_messages=[], api_kwargs={}, active_system_prompt="", conversation_history=None,
+                approx_tokens=100, retry_count=1, max_retries=3, compression_attempts=0, api_call_count=1,
+            )
+        assert verdict.action == "fallthrough"
+        assert verdict.result is None
+        assert verdict.retry_count == 1
+        backoff.assert_called_once()
+        sleep.assert_called_once()
+        agent._try_activate_fallback.assert_not_called()
+        agent._persist_session.assert_not_called()
+
+
 class TestServerInjectedParameterRejection:
     """A 400 blaming a parameter the client never sent is a server-side flake.
 

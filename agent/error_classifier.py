@@ -1284,6 +1284,9 @@ def _classify_400(c: _Ctx) -> Verdict:
     verdict = _first_match(msg, _400_TAIL_RULES)
     if verdict is not None:
         return verdict
+    # Codex intermittently returns this opaque envelope for valid requests that succeed unchanged on replay.
+    if c.provider_slug == "openai-codex" and c.body == {"detail": "Bad Request"}:
+        return _V_SERVER_ERROR
     # Generic 400 + large session → probable overflow (Anthropic can return a
     # bare "Error"); proxy shapes are read so a descriptive rejection isn't "bare".
     body_msg = next((m for m in (str(x or "").strip().lower() for x in _body_message_candidates(c.body)) if m), "")
